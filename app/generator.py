@@ -3,80 +3,95 @@ from .spec import WorkflowSpec
 
 def spec_to_n8n(spec: WorkflowSpec) -> Dict[str, Any]:
     nodes = []
-    connections: Dict[str, Dict[str, list]] = {}
+    name_by_id = {}
 
-    # Trigger node
+    # helper للمواضع
+    def pos(i): return [260 + i*260, 300]
+
+    # Trigger
     if spec.trigger.type == "cron":
         nodes.append({
-            "id": "trigger",
             "name": "Cron",
             "type": "n8n-nodes-base.cron",
             "typeVersion": 1,
             "parameters": {
-                "rule": {
-                    "interval": "custom",
-                    "customInterval": spec.trigger.config.get("cronExpression","0 9 * * *")
-                }
-            }
+                "triggerTimes": [{"hour": 9, "minute": 0}]
+            },
+            "position": pos(0)
         })
+        name_by_id["trigger"] = "Cron"
     else:
         nodes.append({
-            "id": "trigger",
             "name": "Webhook",
             "type": "n8n-nodes-base.webhook",
             "typeVersion": 1,
             "parameters": {
                 "path": spec.trigger.config.get("path","auto/webhook"),
                 "httpMethod": spec.trigger.config.get("method","POST")
-            }
+            },
+            "position": pos(0)
         })
+        name_by_id["trigger"] = "Webhook"
 
-    # Step nodes
-    for s in spec.steps:
+    # Steps
+    for i, s in enumerate(spec.steps, start=1):
         if s.type == "http":
-            nodes.append({
-                "id": s.id, "name": "HTTP Request",
-                "type": "n8n-nodes-base.httpRequest","typeVersion": 3,
-                "parameters": {"url": s.params.get("url"), "method": s.params.get("method","GET")}
-            })
+            node = {
+                "name": "HTTP Request",
+                "type": "n8n-nodes-base.httpRequest",
+                "typeVersion": 3,
+                "parameters": {
+                    "url": s.params.get("url"),
+                    "method": s.params.get("method","GET")
+                },
+                "position": pos(i)
+            }
         elif s.type == "set":
-            nodes.append({
-                "id": s.id, "name": "Set",
-                "type": "n8n-nodes-base.set","typeVersion": 2,
-                "parameters": {"keepOnlySet": True, "values": s.params.get("values",{})}
-            })
+            node = {
+                "name": "Set",
+                "type": "n8n-nodes-base.set",
+                "typeVersion": 2,
+                "parameters": {"keepOnlySet": True, "values": s.params.get("values",{})},
+                "position": pos(i)
+            }
         elif s.type == "telegram":
-            nodes.append({
-                "id": s.id, "name": "Telegram",
-                "type": "n8n-nodes-base.telegram","typeVersion": 2,
+            node = {
+                "name": "Telegram",
+                "type": "n8n-nodes-base.telegram",
+                "typeVersion": 2,
                 "parameters": {
                     "chatId": s.params.get("chatId","={{$env.TELEGRAM_CHAT_ID}}"),
                     "text": s.params.get("message","No message")
                 },
-                "credentials": {"telegramApi": {"id": "TELEGRAM_CRED", "name": "Telegram Account"}}
-            })
+                "credentials": {"telegramApi": "Telegram Account"},
+                "position": pos(i)
+            }
         elif s.type == "if":
-            nodes.append({
-                "id": s.id, "name": "IF",
-                "type": "n8n-nodes-base.if","typeVersion": 2,
-                "parameters": s.params
-            })
-
-    # Build connections helper
-    def add_conn(frm, to):
-        source_name = [n["name"] for n in nodes if n["id"] == frm]
-        if source_name:
-            source = source_name[0]
+            node = {
+                "name": "IF",
+                "type": "n8n-nodes-base.if",
+                "typeVersion": 2,
+                "parameters": s.params,
+                "position": pos(i)
+            }
         else:
-            source = frm
-        connections.setdefault(source, {}).setdefault("main", []).append({"node": [n["name"] for n in nodes if n["id"]==to][0], "type": "main", "index": 0})
+            continue
+        nodes.append(node)
+        name_by_id[s.id] = node["name"]
 
-    # Connect trigger to first step if exists
+    # Connections: n8n expects double array: "main": [[ {...} ]]
+    def edge(frm_name, to_name):
+        return {frm_name: {"main": [[{"node": to_name, "type": "main", "index": 0}]]}}
+
+    connections: Dict[str, Any] = {}
+
+    # وصل الترِغر بأول عقدة إن وُجدت
     if spec.steps:
-        add_conn("trigger", spec.steps[0].id)
+        connections.update(edge(name_by_id["trigger"], name_by_id[spec.steps[0].id]))
 
-    # Explicit edges
+    # وصلات مذكورة في spec
     for e in spec.edges:
-        add_conn(e.from_, e.to)
+        if e.from_ in name_by_id and e.to in name_by_id:
+            connections.update(edge(name_by_id[e.from_], name_by_id[e.to]))
 
     return {"name": spec.name, "nodes": nodes, "connections": connections, "settings": {"timezone": spec.timezone}}
