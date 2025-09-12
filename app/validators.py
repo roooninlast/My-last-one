@@ -1,56 +1,33 @@
-import re, requests
-from typing import List, Tuple
-from croniter import croniter
-from datetime import datetime
+import os, requests
+from typing import List
 from .spec import WorkflowSpec, Step
-
-def validate_cron(expr: str) -> Tuple[bool, str]:
-    try:
-        croniter(expr, datetime.now())
-        return True, ""
-    except Exception as e:
-        return False, str(e)
 
 def static_checks(spec: WorkflowSpec) -> List[str]:
     issues = []
-    # Trigger
+    if not spec.steps:
+        issues.append("لا توجد خطوات في الـ workflow.")
+    # كرون بدائي
     if spec.trigger.type == "cron":
-        ok, msg = validate_cron(spec.trigger.config.get("cronExpression",""))
-        if not ok:
-            issues.append(f"صيغة كرون غير صالحة: {msg}")
-    elif spec.trigger.type == "webhook":
-        path = spec.trigger.config.get("path","")
-        if not path:
-            issues.append("Webhook يحتاج path محدد.")
-    # Steps unique ids
-    ids = [s.id for s in spec.steps]
-    if len(ids) != len(set(ids)):
-        issues.append("هناك تكرار في معرفات العُقد (id).")
-    # Edges refer to real nodes
-    node_ids = set(["trigger"] + ids)
-    for e in spec.edges:
-        if e.from_ not in node_ids:
-            issues.append(f"Edge from يوجه إلى عقدة غير موجودة: {e.from_}")
-        if e.to not in node_ids:
-            issues.append(f"Edge to يوجه إلى عقدة غير موجودة: {e.to}")
+        h = spec.trigger.config.get("hour")
+        m = spec.trigger.config.get("minute")
+        if h is None or m is None:
+            # ليس خطأ قاتل، فقط تنبيه
+            issues.append("تم استخدام Cron بوقت افتراضي 09:00 (لم تُحدد hour/minute).")
     return issues
 
 def active_checks(spec: WorkflowSpec, timeout: float = 4.0) -> List[str]:
+    # تعطيل افتراضيًا على الاستضافة المجانية
+    if os.getenv("SKIP_ACTIVE_CHECKS", "true").lower() in ("1", "true", "yes"):
+        return []
     issues = []
-    # test HTTP endpoints (best-effort)
     for s in spec.steps:
         if s.type == "http":
             url = s.params.get("url")
-            if not url:
-                issues.append(f"HTTP node {s.id} بدون URL.")
-                continue
-            try:
-                r = requests.head(url, timeout=timeout)
-                if r.status_code >= 400:
-                    # try GET
+            if url:
+                try:
                     r = requests.get(url, timeout=timeout)
-                if r.status_code >= 400:
-                    issues.append(f"URL {url} يرجع حالة {r.status_code}.")
-            except Exception as e:
-                issues.append(f"فشل الوصول إلى {url}: {e}")
+                    if r.status_code >= 400:
+                        issues.append(f"فشل الوصول إلى {url}: status {r.status_code}")
+                except Exception as e:
+                    issues.append(f"فشل الوصول إلى {url}: {e}")
     return issues
