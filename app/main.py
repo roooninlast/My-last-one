@@ -1,50 +1,42 @@
 # app/main.py
-import os
-import json
-import asyncio
+import os, json, asyncio, logging, re
 from typing import Any, Dict, Optional
 
 from fastapi import FastAPI, Request, Response
 from fastapi.responses import JSONResponse, PlainTextResponse
 import httpx
 
+# ==== logging ====
+# استخدم لوجر uvicorn إن وُجد، وإلا لوجر باسم app
+logger = logging.getLogger("uvicorn.error")
+if not logger.handlers:
+    logging.basicConfig(level=logging.INFO)
+    logger = logging.getLogger("app")
+
+# ==== env / telegram ====
 BOT_TOKEN = os.getenv("TG_BOT_TOKEN") or os.getenv("TELEGRAM_BOT_TOKEN")
 API_BASE = f"https://api.telegram.org/bot{BOT_TOKEN}" if BOT_TOKEN else None
 
 app = FastAPI(title="TG → n8n JSON Bot")
 
+# ==== helpers ====
 def pick_update(payload: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-    """
-    يستخرج الرسالة من أي نوع تحديث شائع.
-    """
     for key in ("message", "edited_message", "channel_post", "edited_channel_post"):
-        if key in payload and isinstance(payload[key], dict):
+        if isinstance(payload.get(key), dict):
             return payload[key]
     return None
 
-def get_chat_and_text(update_msg: Dict[str, Any]) -> (Optional[int], Optional[str]):
-    chat_id = None
-    text = None
-    try:
-        chat = update_msg.get("chat") or {}
-        chat_id = chat.get("id")
-        # أنواع محتوى مختلفة، نعطي أولوية للنص
-        if "text" in update_msg:
-            text = update_msg["text"]
-        elif "caption" in update_msg:
-            text = update_msg["caption"]
-        else:
-            # fallback لرسائل غير نصية
-            text = None
-    except Exception:
-        chat_id, text = None, None
+def get_chat_and_text(update_msg: Dict[str, Any]) -> tuple[Optional[int], Optional[str]]:
+    chat_id = (update_msg.get("chat") or {}).get("id")
+    text = update_msg.get("text") or update_msg.get("caption")
     return chat_id, text
 
-async def tg_call(method: str, data: Dict[str, Any]) -> Dict[str, Any]:
-    assert API_BASE, "Telegram token missing"
+async def tg_call(method: str, data: Dict[str, Any], files: Dict[str, Any] | None = None) -> Dict[str, Any]:
+    if not API_BASE:
+        return {"ok": False, "error": "missing_token"}
     url = f"{API_BASE}/{method}"
-    async with httpx.AsyncClient(timeout=20) as client:
-        r = await client.post(url, json=data)
+    async with httpx.AsyncClient(timeout=30) as client:
+        r = await client.post(url, json=None if files else data, data=data if files else None, files=files)
         try:
             return r.json()
         except Exception:
@@ -53,8 +45,9 @@ async def tg_call(method: str, data: Dict[str, Any]) -> Dict[str, Any]:
 async def safe_send_message(chat_id: int, text: str) -> None:
     payload = {"chat_id": chat_id, "text": text, "parse_mode": "HTML", "disable_web_page_preview": True}
     res = await tg_call("sendMessage", payload)
-    app.logger.info(f"[sendMessage] -> {res}")
+    logger.info(f"[sendMessage] -> {res}")
 
+# ==== routes ====
 @app.get("/", response_class=PlainTextResponse)
 async def root() -> str:
     return "OK"
@@ -71,76 +64,67 @@ async def health() -> Dict[str, Any]:
 async def telegram_webhook(request: Request) -> Response:
     try:
         body = await request.body()
-        # سجّل الخام ليساعدنا في التشخيص
-        app.logger.info(f"[webhook raw] {body.decode('utf-8','ignore')}")
+        logger.info(f"[webhook raw] {body.decode('utf-8','ignore')}")
         payload = json.loads(body or b"{}")
 
         update_msg = pick_update(payload)
         if not update_msg:
-            app.logger.warning("[webhook] no supported message in update")
+            logger.warning("[webhook] no supported message in update")
             return JSONResponse({"ok": True})
 
         chat_id, text = get_chat_and_text(update_msg)
         if not chat_id:
-            app.logger.warning("[webhook] no chat_id")
+            logger.warning("[webhook] no chat_id")
             return JSONResponse({"ok": True})
 
-        # ردّ تشخيصي فوري دائمًا للتأكد أن البوت حيّ
         if not text:
             await safe_send_message(chat_id, "✅ استلمت رسالة غير نصية. أرسل نصًا لوصف الأتمتة المطلوبة.")
             return JSONResponse({"ok": True})
 
-        # لو وصلت هنا، نردّ “استلمت” بسرعة ثم نُشغّل التحليل/البناء في الخلفية
-        ack = "✅ استلمت طلبك. جاري إعداد خطة الأتمتة…"
-        await safe_send_message(chat_id, ack)
-
-        # شغّل منطق البناء في الخلفية (لا تعتمد على Task صامتة—لفّها بمحاولة ولوج)
+        await safe_send_message(chat_id, "✅ استلمت طلبك. جاري إعداد خطة الأتمتة…")
         asyncio.create_task(handle_automation_request(chat_id, text))
         return JSONResponse({"ok": True})
 
     except Exception as e:
-        app.logger.exception(f"[webhook] exception: {e}")
+        logger.exception(f"[webhook] exception: {e}")
         return JSONResponse({"ok": True})
 
 async def handle_automation_request(chat_id: int, user_text: str) -> None:
-    """
-    هذا مكان التخطيط وبناء JSON لـ n8n.
-    الآن نضع مولّد بسيط عام (placeholder) ليتعامل مع أي نص:
-    - يحاول فهم trigger + action + إرسال النتيجة في ملف JSON.
-    """
     try:
-        # تحليل بسيط: إن وجد وقت مثل 08:00 اعتبره كرون، وإلا نفّذ يدوي
-        import re
-        m = re.search(r"(\d{1,2}):(\d{2})", user_text)
-        if m:
-            hh, mm = m.group(1), m.group(2)
+        time_match = re.search(r"(\d{1,2}):(\d{2})", user_text)
+        if time_match:
+            hh, mm = time_match.group(1), time_match.group(2)
             cron = f"{int(mm)} {int(hh)} * * *"
-            chron_note = f"{hh}:{mm}"
+            when_note = f"{hh}:{mm}"
+            trigger_node = {
+                "id": "n1",
+                "name": "Cron",
+                "type": "n8n-nodes-base.cron",
+                "typeVersion": 1,
+                "parameters": {"rule": {"interval": "custom", "customInterval": cron}},
+            }
+            trigger_name = "Cron"
         else:
-            cron = None
-            chron_note = "يدوي/عند التشغيل"
+            when_note = "يدوي/عند التشغيل"
+            trigger_node = {
+                "id": "n1",
+                "name": "Manual Trigger",
+                "type": "n8n-nodes-base.manualTrigger",
+                "typeVersion": 1,
+                "parameters": {},
+            }
+            trigger_name = "Manual Trigger"
 
-        # مولّد سير عمل افتراضي عام: trigger -> http -> set -> telegram
         workflow = {
             "name": "Generated by Bot",
             "nodes": [
-                {
-                    "id": "n1",
-                    "name": "Cron" if cron else "Manual Trigger",
-                    "type": "n8n-nodes-base.cron" if cron else "n8n-nodes-base.manualTrigger",
-                    "typeVersion": 1,
-                    "parameters": {} if not cron else {"rule": {"interval": "custom", "customInterval": cron}},
-                },
+                trigger_node,
                 {
                     "id": "n2",
                     "name": "HTTP Request",
                     "type": "n8n-nodes-base.httpRequest",
                     "typeVersion": 3,
-                    "parameters": {
-                        # نقطة اختبار آمنة تُرجع نفس ما نرسل (بدل API حقيقي قد يفشل DNS)
-                        "url": "https://httpbin.org/anything",
-                        "method": "GET",
-                    },
+                    "parameters": {"url": "https://httpbin.org/anything", "method": "GET"},
                 },
                 {
                     "id": "n3",
@@ -149,11 +133,7 @@ async def handle_automation_request(chat_id: int, user_text: str) -> None:
                     "typeVersion": 2,
                     "parameters": {
                         "keepOnlySet": True,
-                        "values": {
-                            "string": [
-                                {"name": "msg", "value": f"وُلدت من طلبك: {user_text[:160]}"},
-                            ]
-                        },
+                        "values": {"string": [{"name": "msg", "value": f"وُلدت من طلبك: {user_text[:160]}"}]},
                     },
                 },
                 {
@@ -161,36 +141,27 @@ async def handle_automation_request(chat_id: int, user_text: str) -> None:
                     "name": "Telegram",
                     "type": "n8n-nodes-base.telegram",
                     "typeVersion": 2,
-                    "parameters": {
-                        # استخدم متغير بيئة في n8n لرقم الشات
-                        "chatId": "={{$env.TELEGRAM_CHAT_ID}}",
-                        "text": "={{$json.msg}}",
-                    },
-                    "credentials": {
-                        "telegramApi": {"id": "TELEGRAM_CRED", "name": "Telegram Account"}
-                    },
+                    "parameters": {"chatId": "={{$env.TELEGRAM_CHAT_ID}}", "text": "={{$json.msg}}"},
+                    "credentials": {"telegramApi": {"id": "TELEGRAM_CRED", "name": "Telegram Account"}},
                 },
             ],
             "connections": {
-                ("Cron" if cron else "Manual Trigger"): {"main": [{"node": "HTTP Request", "type": "main", "index": 0}]},
+                trigger_name: {"main": [{"node": "HTTP Request", "type": "main", "index": 0}]},
                 "HTTP Request": {"main": [{"node": "Set", "type": "main", "index": 0}]},
                 "Set": {"main": [{"node": "Telegram", "type": "main", "index": 0}]},
             },
             "settings": {"timezone": os.getenv("TIMEZONE", "Africa/Algiers")},
         }
 
-        # أرسل الملف JSON للمستخدم كمستند
-        content = json.dumps(workflow, ensure_ascii=False, separators=(",", ":"), indent=None).encode("utf-8")
+        content = json.dumps(workflow, ensure_ascii=False).encode("utf-8")
         files = {"document": ("workflow.json", content, "application/json")}
-        data = {
-            "chat_id": chat_id,
-            "caption": f"هذا هو ملف n8n جاهز للاستيراد.\n- موعد التنفيذ: {chron_note} (افتراضي/مستخلص).",
-        }
+        data = {"chat_id": chat_id, "caption": f"هذا هو ملف n8n جاهز للاستيراد.\n- موعد التنفيذ: {when_note} (افتراضي/مستخلص)."}
         async with httpx.AsyncClient(timeout=30) as client:
             r = await client.post(f"{API_BASE}/sendDocument", data=data, files=files)
-            app.logger.info(f"[sendDocument] status={r.status_code} body={r.text}")
+            logger.info(f"[sendDocument] status={r.status_code} body={r.text}")
+
     except Exception as e:
-        app.logger.exception(f"[builder] failed: {e}")
+        logger.exception(f"[builder] failed: {e}")
         try:
             await safe_send_message(chat_id, f"❌ حدث خطأ أثناء تجهيز الخطة: {e}")
         except Exception:
