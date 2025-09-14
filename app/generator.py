@@ -1,115 +1,142 @@
-from __future__ import annotations
-from typing import List, Dict, Any, Tuple
-from .spec import Plan, Step, Edge, N8nNode, N8nWorkflow
+import re
+import time
+import random
+from typing import Dict, Any, List, Tuple
 
-# ---------- تحويل الخطة المجردة إلى n8n ----------
+DEFAULT_TZ = "Africa/Algiers"
 
-def _grid_positions(steps: List[Step]) -> Dict[str, Tuple[int,int]]:
-    # وزّع العقد أفقياً بشكل بسيط
-    x0, y0, dx = 200, 400, 300
-    pos = {}
-    for i, s in enumerate(steps):
-        pos[s.id] = (x0 + i*dx, y0)
-    return pos
+def _uid(prefix: str) -> str:
+    # n8n يستعمل أحيانًا UUID، بس سترينغ فريد يكفي
+    return f"{prefix}_{int(time.time()*1000)}_{random.randint(1000,9999)}"
 
-def to_n8n_node(step: Step, pos: Tuple[int,int]) -> N8nNode:
-    t = step.type
-    name = step.name or t.capitalize()
+def _parse_time(prompt: str) -> Tuple[int, int]:
+    """
+    استخراج ساعة/دقيقة تقريبية من النص. افتراض 09:00 إذا غير مذكور.
+    أمثلة: '08:00' أو '8:00' أو '09:30' أو 'الساعة 7'
+    """
+    m = re.search(r"(\d{1,2})\s*[:：]\s*(\d{2})", prompt)
+    if m:
+        h = max(0, min(23, int(m.group(1))))
+        mi = max(0, min(59, int(m.group(2))))
+        return h, mi
+    m = re.search(r"الساعة\s+(\d{1,2})", prompt)
+    if m:
+        h = max(0, min(23, int(m.group(1))))
+        return h, 0
+    # كلمات مثل “كل يوم” بدون وقت → 09:00
+    return 9, 0
 
-    if t == "cron":
-        node_type = "n8n-nodes-base.cron"; ver=1
-        parameters = step.params or {}
-        # مثال سهل: params قد تحتوي crontab أو كل يوم/ساعة
-        if "crontab" in parameters:
-            rule = {"interval": "custom", "customInterval": parameters["crontab"]}
-            parameters = {"rule": rule}
-    elif t == "webhook":
-        node_type = "n8n-nodes-base.webhook"; ver=1
-        parameters = {
-            "path": step.params.get("path", "hook"),
-            "httpMethod": step.params.get("method","POST"),
-            "responseMode": "onReceived",
-            "responseData": step.params.get("responseData","received"),
+def _needs_schedule(prompt: str) -> bool:
+    """نحاول نفهم إذا المطلوب دوري (كل يوم/ساعة/أسبوع) أو يدوي."""
+    return any(k in prompt for k in ["كل يوم", "كل يومٍ", "every day", "كل ساعة", "weekly", "كل اسبوع", "كل أسبوع"])
+
+def _http_url_from_prompt(prompt: str) -> str:
+    # لو فيه رابط http(s) في النص نستخدمه، وإلا نحط httpbin
+    m = re.search(r"https?://[^\s]+", prompt)
+    return m.group(0) if m else "https://httpbin.org/anything"
+
+def _skeleton_nodes() -> List[Dict[str, Any]]:
+    """نرجّع هيكل أولي فارغ (سيتم تعبئته)."""
+    return []
+
+def spec_to_n8n(user_prompt: str) -> Dict[str, Any]:
+    """
+    يحوّل وصف المستخدم إلى Workflow صالح للاستيراد في n8n.
+    - إذا كان الوصف دوري: Cron → HTTP Request → Set → (Telegram نص اختياري)
+    - إذا يدوي: Manual Trigger (لكن n8n لا يحتاج نود خاصة؛ نستعمل Cron disabled)
+    """
+    prompt = user_prompt.strip()
+
+    nodes = []
+    conns: Dict[str, Dict[str, List[List[Dict[str, Any]]]]] = {}
+
+    x = 260  # مسافات افتراضية بين النودز على الكانفس
+    y = 380
+
+    def add(node: Dict[str, Any]) -> Dict[str, Any]:
+        node["position"] = [len(nodes)*x, y]
+        nodes.append(node)
+        return node
+
+    # 1) Trigger (Cron)
+    cron_name = "Cron"
+    cron_node = {
+        "id": _uid("cron"),
+        "name": cron_name,
+        "type": "n8n-nodes-base.cron",
+        "typeVersion": 1,
+        "parameters": {},
+    }
+
+    if _needs_schedule(prompt):
+        h, mi = _parse_time(prompt)
+        cron_node["parameters"] = {
+            "rule": {
+                "interval": "custom",
+                "customInterval": f"{mi} {h} * * *",
+            },
+            "timezone": DEFAULT_TZ,
         }
-    elif t == "http":
-        node_type = "n8n-nodes-base.httpRequest"; ver=3
-        p = step.params or {}
-        parameters = {
-            "url": p.get("url",""),
-            "method": p.get("method","GET"),
-            "authentication": "none",
-        }
-        if p.get("headers"):
-            parameters["options"] = {"headers": [{"name":k,"value":v} for k,v in p["headers"].items()]}
-        if p.get("json"):
-            parameters["sendBody"] = True
-            parameters["jsonParameters"] = True
-            parameters["options"] = parameters.get("options",{})
-            parameters["options"]["bodyContentType"] = "json"
-            parameters["bodyParametersJson"] = p["json"]
-        if p.get("body"):
-            parameters["sendBody"] = True
-            parameters["options"] = parameters.get("options",{})
-            parameters["options"]["bodyContentType"] = "raw"
-            parameters["body"] = p["body"]
-        if p.get("query"):
-            parameters["options"] = parameters.get("options",{})
-            parameters["options"]["queryParametersUi"] = {"parameter": [{"name":k,"value":v} for k,v in p["query"].items()]}
-    elif t == "set":
-        node_type = "n8n-nodes-base.set"; ver=2
-        parameters = step.params or {"keepOnlySet": True}
-    elif t == "if":
-        # سنحوّلها إلى n8n IF node
-        node_type = "n8n-nodes-base.if"; ver=2
-        expr = step.params.get("expression", "={{true}}")
-        # n8n IF لا يأخذ تعبير واحد، لكن نستخدم "string" و "operation": "contains" بحيلة بسيطة
-        parameters = {
-            "conditions": {
-                "string": [
-                    {"value1": expr, "operation": "contains", "value2": "true"}
-                ]
-            }
-        }
-    elif t == "wait":
-        node_type = "n8n-nodes-base.wait"; ver=1
-        parameters = {"time": {"unit": "seconds", "value": int(step.params.get("seconds", 5))}}
-    elif t == "telegram":
-        node_type = "n8n-nodes-base.telegram"; ver=2
-        p = step.params or {}
-        parameters = {"chatId": p.get("chatId","={{$env.TELEGRAM_CHAT_ID}}"), "text": p.get("text","")}
-        credentials = {"telegramApi": {"id":"TELEGRAM_CRED","name":"Telegram Account"}}
-        return N8nNode(id=step.id, name=name, type=node_type, typeVersion=ver, position=list(pos), parameters=parameters, credentials=credentials)
     else:
-        node_type = "n8n-nodes-base.noOp"; ver=1; parameters = {}
+        # نخليه يشتغل يدويًا: نوقفه (n8n يحترم حالة Inactive) – المستخدم يشغّله يدوي.
+        cron_node["parameters"] = {
+            "rule": {"interval": "custom", "customInterval": "0 9 * * *"},
+            "timezone": DEFAULT_TZ,
+        }
+        cron_node["disabled"] = True
 
-    return N8nNode(
-        id=step.id,
-        name=name,
-        type=node_type,
-        typeVersion=ver,
-        position=list(pos),
-        parameters=parameters
-    )
+    add(cron_node)
 
-def plan_to_n8n(plan: Plan) -> N8nWorkflow:
-    positions = _grid_positions(plan.steps)
-    nodes: List[N8nNode] = [to_n8n_node(s, positions[s.id]) for s in plan.steps]
+    # 2) HTTP Request
+    http_name = "HTTP Request"
+    http_url = _http_url_from_prompt(prompt)
+    http_node = {
+        "id": _uid("http"),
+        "name": http_name,
+        "type": "n8n-nodes-base.httpRequest",
+        "typeVersion": 3,
+        "parameters": {
+            "url": http_url,
+            "method": "GET",
+        },
+    }
+    add(http_node)
 
-    # connections
-    connections: Dict[str, Dict[str, List[Dict[str,Any]]]] = {}
-    for e in plan.edges:
-        src = next((n for n in nodes if n.id == e.from_), None)
-        dst = next((n for n in nodes if n.id == e.to), None)
-        if not src or not dst: 
-            # نتجاهل الربط غير الصحيح بدلاً من إسقاط الاستيراد كله
-            continue
-        con_key = src.name
-        connections.setdefault(con_key, {"main": []})
-        connections[con_key]["main"].append({"node": dst.name, "type": "main", "index": 0})
+    # 3) Set (صياغة رسالة/قيمة)
+    set_name = "Set"
+    set_node = {
+        "id": _uid("set"),
+        "name": set_name,
+        "type": "n8n-nodes-base.set",
+        "typeVersion": 2,
+        "parameters": {
+            "keepOnlySet": True,
+            "values": {
+                "string": [
+                    {"name": "msg", "value": "تم التنفيذ بنجاح ✅"}
+                ]
+            },
+        },
+    }
+    add(set_node)
 
-    return N8nWorkflow(
-        name=plan.name,
-        nodes=nodes,
-        connections=connections,
-        settings={"timezone": plan.timezone or "UTC"}
-    )
+    # مبدئيًا ما نحط نود Telegram لأن اعتماداتها تختلف عند كل مستخدم
+    # لكن نحفّز المستخدم برسالة الـ Set — يقدر يضيف Node الإرسال بنفسه إن أراد.
+
+    # connections — مهم: لازم تكون [[{...}]]
+    conns[cron_name] = {
+        "main": [[{"node": http_name, "type": "main", "index": 0}]]
+    }
+    conns[http_name] = {
+        "main": [[{"node": set_name, "type": "main", "index": 0}]]
+    }
+
+    workflow = {
+        "name": "Generated by Bot",
+        "nodes": nodes,
+        "connections": conns,
+        "settings": {
+            "timezone": DEFAULT_TZ
+        }
+    }
+    return workflow
