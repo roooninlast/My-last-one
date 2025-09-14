@@ -1,32 +1,48 @@
-# app/spec.py
-from pydantic import BaseModel, Field, ConfigDict
-from typing import Any, Dict, List, Optional
+from __future__ import annotations
+from pydantic import BaseModel, Field, field_validator
+from typing import List, Literal, Optional, Dict, Any
 
-class Trigger(BaseModel):
-    type: str  # "cron" أو "webhook" ...
-    config: Dict[str, Any] = {}
+# ---------- خطة مجردة (يُنتجها الـ LLM) ----------
+
+StepType = Literal["cron", "webhook", "http", "set", "if", "wait", "telegram"]
 
 class Step(BaseModel):
-    id: str
-    type: str  # "http" | "set" | "if" | ...
-    params: Dict[str, Any] = {}
+    id: str = Field(..., description="unique id (slug)")
+    type: StepType
+    name: Optional[str] = None
+    params: Dict[str, Any] = Field(default_factory=dict)
 
 class Edge(BaseModel):
-    # 👇 هذا هو المهم
-    model_config = ConfigDict(populate_by_name=True)  # يقبل from_ كبديل لـ from
     from_: str = Field(..., alias="from")
     to: str
-    # حقول اختيارية مفيدة لـ n8n:
-    type: str = "main"
-    index: int = 0
 
-class WorkflowSpec(BaseModel):
-    name: str = "Generated Workflow"
-    timezone: str = "Africa/Algiers"
-    trigger: Trigger
-    steps: List[Step] = []
-    edges: List[Edge] = []
+class Plan(BaseModel):
+    name: str
+    steps: List[Step]
+    edges: List[Edge]
+    timezone: Optional[str] = "UTC"
 
-    # للتصدير مع aliases (from)
-    def as_dict(self) -> Dict[str, Any]:
-        return self.model_dump(by_alias=True)
+    @field_validator("steps")
+    @classmethod
+    def unique_ids(cls, v: List[Step]):
+        ids = [s.id for s in v]
+        if len(ids) != len(set(ids)):
+            raise ValueError("Step ids must be unique")
+        return v
+
+# ---------- n8n workflow (المنتج النهائي) ----------
+
+class N8nNode(BaseModel):
+    id: str
+    name: str
+    type: str
+    typeVersion: int
+    position: List[int]
+    parameters: Dict[str, Any] = Field(default_factory=dict)
+    credentials: Optional[Dict[str, Dict[str, str]]] = None
+
+class N8nWorkflow(BaseModel):
+    name: str
+    nodes: List[N8nNode]
+    connections: Dict[str, Dict[str, List[Dict[str, Any]]]]
+    settings: Dict[str, Any] = Field(default_factory=dict)
