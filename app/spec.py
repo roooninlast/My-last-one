@@ -1,23 +1,32 @@
-from pydantic import BaseModel, Field, constr
-from typing import List, Literal, Dict, Any
-
-class Edge(BaseModel):
-    from_: constr(min_length=1) = Field(alias="from")
-    to: constr(min_length=1)
+# app/spec.py
+from pydantic import BaseModel, Field, ConfigDict
+from typing import Any, Dict, List, Optional
 
 class Trigger(BaseModel):
-    type: Literal["cron","webhook"]
+    type: str  # "cron" أو "webhook" ...
     config: Dict[str, Any] = {}
 
 class Step(BaseModel):
-    id: constr(min_length=1)
-    type: Literal["http","if","set","telegram"]
+    id: str
+    type: str  # "http" | "set" | "if" | ...
     params: Dict[str, Any] = {}
 
+class Edge(BaseModel):
+    # 👇 هذا هو المهم
+    model_config = ConfigDict(populate_by_name=True)  # يقبل from_ كبديل لـ from
+    from_: str = Field(..., alias="from")
+    to: str
+    # حقول اختيارية مفيدة لـ n8n:
+    type: str = "main"
+    index: int = 0
+
 class WorkflowSpec(BaseModel):
-    name: constr(min_length=1)
+    name: str = "Generated Workflow"
     timezone: str = "Africa/Algiers"
     trigger: Trigger
-    steps: List[Step]
-    edges: List[Edge]
-    placeholders: List[constr(min_length=1)] = []
+    steps: List[Step] = []
+    edges: List[Edge] = []
+
+    # للتصدير مع aliases (from)
+    def as_dict(self) -> Dict[str, Any]:
+        return self.model_dump(by_alias=True)
