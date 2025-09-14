@@ -1,94 +1,197 @@
-from __future__ import annotations
-import os, json
-from fastapi import FastAPI, Request
+# app/main.py
+import os
+import json
+import asyncio
+from typing import Any, Dict, Optional
+
+from fastapi import FastAPI, Request, Response
 from fastapi.responses import JSONResponse, PlainTextResponse
-from pydantic import ValidationError
+import httpx
 
-from .llm import call_openrouter
-from .validators import LLMEnvelope, coerce_json
-from .spec import Plan
-from .generator import plan_to_n8n
-from .telegram import send_text, send_document
+BOT_TOKEN = os.getenv("TG_BOT_TOKEN") or os.getenv("TELEGRAM_BOT_TOKEN")
+API_BASE = f"https://api.telegram.org/bot{BOT_TOKEN}" if BOT_TOKEN else None
 
-app = FastAPI()
+app = FastAPI(title="TG → n8n JSON Bot")
 
-@app.get("/health")
-def health():
-    return {"ok": True}
+def pick_update(payload: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """
+    يستخرج الرسالة من أي نوع تحديث شائع.
+    """
+    for key in ("message", "edited_message", "channel_post", "edited_channel_post"):
+        if key in payload and isinstance(payload[key], dict):
+            return payload[key]
+    return None
 
-@app.get("/")
-def root():
-    return PlainTextResponse("n8n planner bot is running")
+def get_chat_and_text(update_msg: Dict[str, Any]) -> (Optional[int], Optional[str]):
+    chat_id = None
+    text = None
+    try:
+        chat = update_msg.get("chat") or {}
+        chat_id = chat.get("id")
+        # أنواع محتوى مختلفة، نعطي أولوية للنص
+        if "text" in update_msg:
+            text = update_msg["text"]
+        elif "caption" in update_msg:
+            text = update_msg["caption"]
+        else:
+            # fallback لرسائل غير نصية
+            text = None
+    except Exception:
+        chat_id, text = None, None
+    return chat_id, text
 
-# ---------- Telegram Webhook ----------
-TG = os.getenv("TG_BOT_TOKEN","")
+async def tg_call(method: str, data: Dict[str, Any]) -> Dict[str, Any]:
+    assert API_BASE, "Telegram token missing"
+    url = f"{API_BASE}/{method}"
+    async with httpx.AsyncClient(timeout=20) as client:
+        r = await client.post(url, json=data)
+        try:
+            return r.json()
+        except Exception:
+            return {"ok": False, "status": r.status_code, "text": r.text}
+
+async def safe_send_message(chat_id: int, text: str) -> None:
+    payload = {"chat_id": chat_id, "text": text, "parse_mode": "HTML", "disable_web_page_preview": True}
+    res = await tg_call("sendMessage", payload)
+    app.logger.info(f"[sendMessage] -> {res}")
+
+@app.get("/", response_class=PlainTextResponse)
+async def root() -> str:
+    return "OK"
+
+@app.get("/health", response_class=JSONResponse)
+async def health() -> Dict[str, Any]:
+    return {
+        "ok": True,
+        "has_token": bool(BOT_TOKEN),
+        "env": {"PORT": os.getenv("PORT"), "TZ": os.getenv("TIMEZONE")},
+    }
 
 @app.post("/telegram")
-async def telegram_webhook(req: Request):
-    data = await req.json()
+async def telegram_webhook(request: Request) -> Response:
     try:
-        msg = (data.get("message") or data.get("edited_message") or {}).get("text","").strip()
-        chat_id = (data.get("message") or data.get("edited_message") or {}).get("chat",{}).get("id")
+        body = await request.body()
+        # سجّل الخام ليساعدنا في التشخيص
+        app.logger.info(f"[webhook raw] {body.decode('utf-8','ignore')}")
+        payload = json.loads(body or b"{}")
 
-        if not msg:
+        update_msg = pick_update(payload)
+        if not update_msg:
+            app.logger.warning("[webhook] no supported message in update")
             return JSONResponse({"ok": True})
 
-        if msg.lower() in ["help","/help","/start","start","مساعدة"]:
-            help_text = (
-                "أرسل وصف الأتمتة بالعربية (أو الإنجليزية) وسأحوّله لملف n8n.\n"
-                "مثال: كل يوم 08:00 اجلب سعر BTC ثم أرسل إشعار تيليغرام.\n"
-                "سأعيد لك ملف workflow.json جاهز للاستيراد."
-            )
-            send_text(help_text, chat_id)
-            return {"ok": True}
+        chat_id, text = get_chat_and_text(update_msg)
+        if not chat_id:
+            app.logger.warning("[webhook] no chat_id")
+            return JSONResponse({"ok": True})
 
-        # 1) أطلب من الـ LLM إنشاء خطة مُقيّدة
-        prompt = f"حوّل هذا الوصف إلى خطة أتمتة عامة: {msg}"
-        llm_raw = call_openrouter(prompt)
+        # ردّ تشخيصي فوري دائمًا للتأكد أن البوت حيّ
+        if not text:
+            await safe_send_message(chat_id, "✅ استلمت رسالة غير نصية. أرسل نصًا لوصف الأتمتة المطلوبة.")
+            return JSONResponse({"ok": True})
 
-        # 2) تحقّق/استخراج JSON
-        payload = coerce_json(llm_raw)
+        # لو وصلت هنا، نردّ “استلمت” بسرعة ثم نُشغّل التحليل/البناء في الخلفية
+        ack = "✅ استلمت طلبك. جاري إعداد خطة الأتمتة…"
+        await safe_send_message(chat_id, ack)
 
-        # 3) تحقّق بالـ Pydantic
-        env = LLMEnvelope(**payload)
-        plan = Plan(**env.plan)
+        # شغّل منطق البناء في الخلفية (لا تعتمد على Task صامتة—لفّها بمحاولة ولوج)
+        asyncio.create_task(handle_automation_request(chat_id, text))
+        return JSONResponse({"ok": True})
 
-        # 4) حولها إلى n8n workflow
-        wf = plan_to_n8n(plan)
-        wf_bytes = json.dumps(wf.model_dump(), ensure_ascii=False, separators=(",",":")).encode("utf-8")
-
-        # 5) أرسل الملف
-        send_document(wf_bytes, "workflow.json", "هذا هو ملف n8n جاهز للاستيراد.", chat_id)
-
-        # ملاحظات قصيرة (افتراضات)
-        assumptions = []
-        # مثال صغير: إن لم يجد plan.timezone نضع UTC
-        if not plan.timezone:
-            assumptions.append("- تم افتراض المنطقة الزمنية: UTC.")
-        if assumptions:
-            send_text("افتراضات:\n"+"\n".join(assumptions), chat_id)
-
-        return {"ok": True}
-
-    except ValidationError as ve:
-        send_text(f"validation error: {ve}", chat_id)
-        return {"ok": True}
     except Exception as e:
-        # فشل عام → أعطِ ملف بديل بسيط كي لا ترجع صفر
-        fallback = {
-            "name":"Simple Echo",
-            "nodes":[
+        app.logger.exception(f"[webhook] exception: {e}")
+        return JSONResponse({"ok": True})
+
+async def handle_automation_request(chat_id: int, user_text: str) -> None:
+    """
+    هذا مكان التخطيط وبناء JSON لـ n8n.
+    الآن نضع مولّد بسيط عام (placeholder) ليتعامل مع أي نص:
+    - يحاول فهم trigger + action + إرسال النتيجة في ملف JSON.
+    """
+    try:
+        # تحليل بسيط: إن وجد وقت مثل 08:00 اعتبره كرون، وإلا نفّذ يدوي
+        import re
+        m = re.search(r"(\d{1,2}):(\d{2})", user_text)
+        if m:
+            hh, mm = m.group(1), m.group(2)
+            cron = f"{int(mm)} {int(hh)} * * *"
+            chron_note = f"{hh}:{mm}"
+        else:
+            cron = None
+            chron_note = "يدوي/عند التشغيل"
+
+        # مولّد سير عمل افتراضي عام: trigger -> http -> set -> telegram
+        workflow = {
+            "name": "Generated by Bot",
+            "nodes": [
                 {
-                    "id":"webhook1","name":"Webhook","type":"n8n-nodes-base.webhook","typeVersion":1,
-                    "position":[300,400],
-                    "parameters":{"path":"hook","httpMethod":"POST","responseMode":"onReceived","responseData":"ok"}
-                }
+                    "id": "n1",
+                    "name": "Cron" if cron else "Manual Trigger",
+                    "type": "n8n-nodes-base.cron" if cron else "n8n-nodes-base.manualTrigger",
+                    "typeVersion": 1,
+                    "parameters": {} if not cron else {"rule": {"interval": "custom", "customInterval": cron}},
+                },
+                {
+                    "id": "n2",
+                    "name": "HTTP Request",
+                    "type": "n8n-nodes-base.httpRequest",
+                    "typeVersion": 3,
+                    "parameters": {
+                        # نقطة اختبار آمنة تُرجع نفس ما نرسل (بدل API حقيقي قد يفشل DNS)
+                        "url": "https://httpbin.org/anything",
+                        "method": "GET",
+                    },
+                },
+                {
+                    "id": "n3",
+                    "name": "Set",
+                    "type": "n8n-nodes-base.set",
+                    "typeVersion": 2,
+                    "parameters": {
+                        "keepOnlySet": True,
+                        "values": {
+                            "string": [
+                                {"name": "msg", "value": f"وُلدت من طلبك: {user_text[:160]}"},
+                            ]
+                        },
+                    },
+                },
+                {
+                    "id": "n4",
+                    "name": "Telegram",
+                    "type": "n8n-nodes-base.telegram",
+                    "typeVersion": 2,
+                    "parameters": {
+                        # استخدم متغير بيئة في n8n لرقم الشات
+                        "chatId": "={{$env.TELEGRAM_CHAT_ID}}",
+                        "text": "={{$json.msg}}",
+                    },
+                    "credentials": {
+                        "telegramApi": {"id": "TELEGRAM_CRED", "name": "Telegram Account"}
+                    },
+                },
             ],
-            "connections":{},
-            "settings":{"timezone": os.getenv("TIMEZONE","UTC")}
+            "connections": {
+                ("Cron" if cron else "Manual Trigger"): {"main": [{"node": "HTTP Request", "type": "main", "index": 0}]},
+                "HTTP Request": {"main": [{"node": "Set", "type": "main", "index": 0}]},
+                "Set": {"main": [{"node": "Telegram", "type": "main", "index": 0}]},
+            },
+            "settings": {"timezone": os.getenv("TIMEZONE", "Africa/Algiers")},
         }
-        wf_bytes = json.dumps(fallback, ensure_ascii=False).encode("utf-8")
-        if TG:
-            send_document(wf_bytes, "workflow.json", "تعذر إنشاء الخطة الذكية؛ هذا ملف بديل (Webhook).")
-            send_text(f"الخطأ: {e!s}")
-        return {"ok": True}
+
+        # أرسل الملف JSON للمستخدم كمستند
+        content = json.dumps(workflow, ensure_ascii=False, separators=(",", ":"), indent=None).encode("utf-8")
+        files = {"document": ("workflow.json", content, "application/json")}
+        data = {
+            "chat_id": chat_id,
+            "caption": f"هذا هو ملف n8n جاهز للاستيراد.\n- موعد التنفيذ: {chron_note} (افتراضي/مستخلص).",
+        }
+        async with httpx.AsyncClient(timeout=30) as client:
+            r = await client.post(f"{API_BASE}/sendDocument", data=data, files=files)
+            app.logger.info(f"[sendDocument] status={r.status_code} body={r.text}")
+    except Exception as e:
+        app.logger.exception(f"[builder] failed: {e}")
+        try:
+            await safe_send_message(chat_id, f"❌ حدث خطأ أثناء تجهيز الخطة: {e}")
+        except Exception:
+            pass
