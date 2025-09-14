@@ -1,33 +1,26 @@
-import os, requests
-from typing import List
-from .spec import WorkflowSpec, Step
+from __future__ import annotations
+from pydantic import BaseModel, field_validator
+from typing import Dict, Any
+import json
 
-def static_checks(spec: WorkflowSpec) -> List[str]:
-    issues = []
-    if not spec.steps:
-        issues.append("لا توجد خطوات في الـ workflow.")
-    # كرون بدائي
-    if spec.trigger.type == "cron":
-        h = spec.trigger.config.get("hour")
-        m = spec.trigger.config.get("minute")
-        if h is None or m is None:
-            # ليس خطأ قاتل، فقط تنبيه
-            issues.append("تم استخدام Cron بوقت افتراضي 09:00 (لم تُحدد hour/minute).")
-    return issues
+class LLMEnvelope(BaseModel):
+    """نطلب من الـ LLM يعيد JSON داخل هذا الظرف للحماية من الخروج النصّي."""
+    plan: Dict[str, Any]
 
-def active_checks(spec: WorkflowSpec, timeout: float = 4.0) -> List[str]:
-    # تعطيل افتراضيًا على الاستضافة المجانية
-    if os.getenv("SKIP_ACTIVE_CHECKS", "true").lower() in ("1", "true", "yes"):
-        return []
-    issues = []
-    for s in spec.steps:
-        if s.type == "http":
-            url = s.params.get("url")
-            if url:
-                try:
-                    r = requests.get(url, timeout=timeout)
-                    if r.status_code >= 400:
-                        issues.append(f"فشل الوصول إلى {url}: status {r.status_code}")
-                except Exception as e:
-                    issues.append(f"فشل الوصول إلى {url}: {e}")
-    return issues
+    @field_validator("plan")
+    @classmethod
+    def must_have(cls, v):
+        if "steps" not in v or "edges" not in v or "name" not in v:
+            raise ValueError("Invalid plan format")
+        return v
+
+def coerce_json(text: str) -> Dict[str, Any]:
+    """يحاول استخراج JSON من نص الـ LLM بأمان."""
+    # أبسط محاولة قوية: ابحث عن أول { وآخر } وجرّب
+    try:
+        start = text.index("{")
+        end = text.rindex("}")
+        payload = text[start:end+1]
+        return json.loads(payload)
+    except Exception:
+        raise ValueError("LLM did not return valid JSON")
