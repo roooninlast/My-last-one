@@ -1,76 +1,50 @@
-import os, re
-from typing import Optional
-from .spec import WorkflowSpec
-from .skills import capabilities, tpl_cron_http_to_telegram, tpl_monitor_status_every_5min, tpl_ai_video_outline_to_telegram
+from __future__ import annotations
+import os, httpx, json
 
-USE_LLM = os.getenv("USE_LLM_PLANNER", "false").lower() in ("1","true","yes")
+OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "")
 
-def _looks(s: str, pat: str) -> bool:
-    return re.search(pat, s, flags=re.IGNORECASE) is not None
+SYSTEM = (
+"أنت مخطط أتمتة عام. حوّل وصف المستخدم إلى خطة JSON مُقيّدة."
+" لا تعُد أي شرح. أعد JSON فقط بالمخطط وفق هذا الـ schema:\n"
+"{"
+'  "plan": {'
+'    "name": "string",'
+'    "timezone": "string (IANA, optional)",'
+'    "steps": ['
+'      {"id":"slug","type":"cron|webhook|http|set|if|wait|telegram","name":"opt","params":{...}}'
+'    ],'
+'    "edges": [ {"from":"step_id","to":"step_id"} ]'
+"  }"
+"}\n"
+"قواعد مهمة:\n"
+"- ids فريدة قصيرة (english slug).\n"
+"- لو الوصف لا يحتوي جدولة، لا تنشئ cron.\n"
+"- لو الوصف ذكر تيليغرام للإشعار أضف step type=telegram مع params {chatId:'{{$env.TELEGRAM_CHAT_ID}}', text:'...'}.\n"
+"- http params مثال: {method:'GET|POST', url:'https://...', headers:{}, query:{}, body:{}, json:{}}.\n"
+"- set params: {keepOnlySet:true, values:{string:[{name:'key', value:'={{expr}}'}]}}.\n"
+"- if params: {expression:'={{ $json.ok == true }}', then:'id', else:'id'} (سنتحوّلها لاحقاً إلى عقد n8n).\n"
+"- wait params: {seconds: 10}.\n"
+"- لا تستخدم مفاتيح حقيقية؛ استخدم متغيرات بيئة مثل {{$env.MY_KEY}} إذا لزم.\n"
+)
 
-def _parse_time_hhmm(text: str) -> Optional[tuple]:
-    m = re.search(r'(\d{1,2})[:٫\.](\d{2})', text)
-    if m:
-        h, mm = int(m.group(1)), int(m.group(2))
-        if 0 <= h < 24 and 0 <= mm < 60:
-            return h, mm
-    if _looks(text, r'\bكل\s*5\s*د(ق|قائق|قائق|قائق)\b') or "every 5" in text.lower():
-        return (0, "*/5")
-    return None
-
-def plan_from_text(user_text: str) -> WorkflowSpec:
-    caps = capabilities()
-    t = user_text.strip()
-
-    # 1) حالات “مراقبة خدمة” / “لو تعطّل نبّهني”
-    if _looks(t, r'راقب|monitor|status|تعط'):
-        url = "https://httpbin.org/status/200"
-        m = re.search(r'(https?://\S+)', t)
-        if m: url = m.group(1)
-        return tpl_monitor_status_every_5min(url)
-
-    # 2) “أرسل لي سعر/بيانات كل يوم/ساعة…”
-    if _looks(t, r'سعر|price|btc|بتكوين|بيتكوين'):
-        hhmm = _parse_time_hhmm(t) or (9, 0)
-        hour, minute = hhmm
-        return tpl_cron_http_to_telegram(
-            name="Daily BTC to Telegram",
-            url="https://api.binance.com/api/v3/ticker/price?symbol=BTCUSDT",
-            method="GET",
-            set_expr="={{`BTC/USDT: ${Number($json[\"price\"] || 0).toFixed(2)}`}}",
-            message="={{$json.msg}}",
-            hour=hour if isinstance(hour, int) else 9,
-            minute=minute if isinstance(minute, int) else 0
-        )
-
-    # 3) “اصنع فيديو AI وانشره” → نولّد مخطط نصي يومي كنسخة أولى
-    if _looks(t, r'فيديو|video') and _looks(t, r'ذكاء|اصطناعي|ai'):
-        prompt = re.sub(r'[\r\n]+', ' ', t)
-        return tpl_ai_video_outline_to_telegram(prompt)
-
-    # 4) طلب عام “أرسل لي ملخص/خبر/..” → قالب HTTP→Set→Telegram
-    if _looks(t, r'ارسِل|ابعت|ذكّر|remind|send|notify'):
-        url = "https://httpbin.org/json"
-        m = re.search(r'(https?://\S+)', t)
-        if m: url = m.group(1)
-        hhmm = _parse_time_hhmm(t) or (9, 0)
-        hour, minute = hhmm
-        return tpl_cron_http_to_telegram(
-            name="Scheduled Fetch & Notify",
-            url=url,
-            method="GET",
-            set_expr="={{`النتيجة: ${JSON.stringify($json).slice(0,180)}...`}}",
-            message="={{$json.msg}}",
-            hour=hour if isinstance(hour, int) else 9,
-            minute=minute if isinstance(minute, int) else 0
-        )
-
-    # 5) افتراضي: ردّ بخطّة معقولة بدل رفض
-    return tpl_cron_http_to_telegram(
-        name="Daily Digest to Telegram",
-        url="https://httpbin.org/json",
-        method="GET",
-        set_expr="={{`ملخص يومي: ${($json.slideshow && $json.slideshow.title) || 'OK'}`}}",
-        message="={{$json.msg}}",
-        hour=9, minute=0
-    )
+def call_openrouter(prompt: str) -> str:
+    if not OPENROUTER_API_KEY:
+        raise RuntimeError("OPENROUTER_API_KEY is missing")
+    model = "openrouter/auto"  # يختار موديل مناسب
+    headers = {
+        "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+        "Content-Type": "application/json",
+    }
+    payload = {
+        "model": model,
+        "messages": [
+            {"role": "system", "content": SYSTEM},
+            {"role": "user", "content": prompt}
+        ],
+        "temperature": 0.2,
+    }
+    with httpx.Client(timeout=60) as client:
+        r = client.post("https://openrouter.ai/api/v1/chat/completions", headers=headers, data=json.dumps(payload))
+        r.raise_for_status()
+        data = r.json()
+        return data["choices"][0]["message"]["content"]
