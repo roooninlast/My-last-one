@@ -1,16 +1,9 @@
 services:
-- type: web
-  name: telegram-n8n-bot
-  env: python
-  plan: free
-  buildCommand: pip install -r requirements.txt
-  startCommand: uvicorn app.main:app --host 0.0.0.0 --port $PORT
-  envVars:
-  - key: TG_BOT_TOKEN
-    sync: false
-  - key: PUBLIC_BASE_URL
-    sync: false
-  - key: DEMO_MODE
-    value: "true"
-  - key: TIMEZONE
-    value: "Africa/Algiers"
+  - type: web
+    name: n8n-plan-bot
+    env: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn app.main:app --host 0.0.0.0 --port $PORT
+    envVars:
+      - key: PYTHONUNBUFFERED
+        value: "1"
