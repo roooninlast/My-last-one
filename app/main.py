@@ -1,117 +1,170 @@
-import os, json, re, requests
-from fastapi import FastAPI, Request
-from pydantic import ValidationError
-from .spec import WorkflowSpec
+# app/main.py
+import os
+import re
+import json
+import time
+import tempfile
+from typing import Any, Dict, Optional
+
+import httpx
+from fastapi import FastAPI, Request, Response
+from fastapi.responses import JSONResponse
+
+# مكوّناتنا الداخلية
 from .llm import plan_from_text
 from .generator import spec_to_n8n
 from .validators import static_checks, active_checks
 
-TG_BOT_TOKEN = os.getenv("TG_BOT_TOKEN")
-TIMEZONE = os.getenv("TIMEZONE","Africa/Algiers")
+# ========= إعدادات عامة =========
+BOT_TOKEN = (
+    os.getenv("TG_BOT_TOKEN")
+    or os.getenv("TELEGRAM_BOT_TOKEN")
+    or os.getenv("TELEGRAM_TOKEN")
+)
+API_BASE = f"https://api.telegram.org/bot{BOT_TOKEN}" if BOT_TOKEN else None
 
-app = FastAPI(title="Telegram → n8n JSON Bot")
+APP_TZ = os.getenv("TIMEZONE", "Africa/Algiers")
 
-def tg_send(chat_id, text):
-    if not TG_BOT_TOKEN:
+# تعطيل فحوص الشبكة افتراضيًا على الاستضافة المجانية
+SKIP_ACTIVE = os.getenv("SKIP_ACTIVE_CHECKS", "true").lower() in ("1", "true", "yes")
+
+# ========= FastAPI =========
+app = FastAPI()
+
+# ========= أدوات مساعدة للتيليغرام =========
+async def tg_send(chat_id: int | str, text: str, parse_mode: Optional[str] = None) -> None:
+    if not API_BASE:
         return
-    requests.post(f"https://api.telegram.org/bot{TG_BOT_TOKEN}/sendMessage",
-                  json={"chat_id": chat_id, "text": text})
+    payload = {"chat_id": chat_id, "text": text}
+    if parse_mode:
+        payload["parse_mode"] = parse_mode
+    async with httpx.AsyncClient(timeout=15) as client:
+        try:
+            await client.post(f"{API_BASE}/sendMessage", json=payload)
+        except Exception:
+            pass  # لا نكسر التنفيذ لو فشل الإرسال
 
-def tg_send_doc(chat_id, filename, content_bytes, caption=None):
-    if not TG_BOT_TOKEN:
+async def tg_send_document(chat_id: int | str, filename: str, bytes_data: bytes, caption: Optional[str] = None) -> None:
+    if not API_BASE:
         return
-    files = {"document": (filename, content_bytes, "application/json")}
-    data = {"chat_id": chat_id}
+    data = {"chat_id": str(chat_id)}
     if caption:
         data["caption"] = caption
-    requests.post(f"https://api.telegram.org/bot{TG_BOT_TOKEN}/sendDocument",
-                  data=data, files=files)
+    files = {"document": (filename, bytes_data, "application/json")}
+    async with httpx.AsyncClient(timeout=30) as client:
+        try:
+            await client.post(f"{API_BASE}/sendDocument", data=data, files=files)
+        except Exception:
+            pass
 
-@app.get("/health")
-def health():
-    return {"ok": True}
-
-# ---------------------------
-# نكشف النية (تحية/عادي/أتمتة)
-# ---------------------------
-GREETINGS = {
-    "مرحبا", "السلام", "سلام", "اهلا", "أهلا", "هاي", "هلا", "صباح الخير",
-    "مساء الخير", "hi", "hello", "hey", "yo"
-}
+# ========= منطق كشف "هل النص يبدو كطلب أتمتة؟" لكن بدون منع التنفيذ =========
 TASK_HINTS = [
-    # كلمات تدل على مهمة/أتمتة بالعربية
-    r"\bكل يوم\b", r"\bكل اسبوع\b", r"\bكل أسبوع\b", r"\bكل ساعة\b",
-    r"\bالساعة\s*\d", r"\bجدول\b", r"\bجدولة\b", r"\bأرسل\b", r"\bارسل\b",
-    r"\bابعت\b", r"\bنبهني\b", r"\bانبهني\b", r"\bجِب\b|\bجيب\b", r"\bسجّل\b|\bسجل\b",
-    r"\bwebhook\b", r"\bcron\b",
-    # بالإنجليزية
-    r"\bevery day\b", r"\bevery\s+\w+\b", r"\bat\s*\d", r"\bsend\b", r"\bfetch\b",
-    r"\bnotify\b", r"\balert\b", r"\bcron\b", r"\bwebhook\b"
+    # تكرار/جدولة
+    r"كل\s*يوم", r"كليوم", r"يومي(?:ً|ا)?", r"every\s*day", r"\bdaily\b",
+    r"كل\s*ساع(?:ة|ه)", r"ساع(?:يًا|يا)?", r"every\s*hour",
+    r"\bcron\b", r"\bwebhook\b",
+    # أفعال تنفيذ/تنبيه
+    r"اصنع|أنشئ|انشئ|اعمل|سو(?:ي)?|generate|create|send|notify|alert|fetch|monitor|راقب|نبهني|ابعث|ارسل",
+    # توقيتات شائعة
+    r"\bالساعة\s*\d", r"\b(?:0?\d|1\d|2[0-3])[:٫\.]\d{2}\b"
 ]
-
-def is_greeting(text: str) -> bool:
-    t = text.strip().lower()
-    return t in {g.lower() for g in GREETINGS}
 
 def looks_like_task(text: str) -> bool:
     t = text.strip().lower()
-    return any(re.search(p, t) for p in TASK_HINTS)
+    return any(re.search(p, t) for p in TASK_HINTS) or len(t) > 8
 
-HELP_MSG = (
-    "أهلًا! ✨\n"
-    "أنا أصنع لك ملف n8n جاهز للاستيراد.\n\n"
-    "اكتب وصف الأتمتة بصيغة واضحة، أمثلة:\n"
-    "• كل يوم 09:00 جيب سعر EUR→DZD وإذا تغيّر >1% ابعثه لي على تيليغرام.\n"
-    "• أنشئ Webhook يستقبل email و pdf_url، نزّل الـ PDF وارفعه إلى Google Drive ثم أرسل الرابط.\n"
-    "• راقب موقع example.com/status كل ساعة وإذا status != ok نبهني.\n\n"
-    "للشرح السريع اكتب: /help"
-)
+# ========= نقاط النهاية =========
+@app.get("/health")
+async def health() -> Dict[str, Any]:
+    return {"ok": True, "ts": int(time.time())}
 
 @app.post("/telegram")
-async def telegram_webhook(update: dict):
-    msg = (update.get("message") or update.get("edited_message") or {})
-    chat_id = (msg.get("chat") or {}).get("id")
-    text = msg.get("text") or ""
-    if not chat_id:
-        return {"ok": True}
+async def telegram_webhook(req: Request) -> Response:
+    """
+    Webhook تيليغرام: يستقبل أي رسالة نصية من المستخدم،
+    يحوّل الوصف إلى خطة، يولّد JSON متوافق مع n8n، ويُرسله كمستند.
+    """
+    if not BOT_TOKEN:
+        return JSONResponse({"ok": False, "error": "Missing BOT_TOKEN"}, status_code=500)
 
-    t = text.strip()
+    payload = await req.json()
+    message = payload.get("message") or payload.get("edited_message")
+    if not message:
+        return JSONResponse({"ok": True})
 
-    # أوامر مباشرة
-    if t.startswith("/start") or t.startswith("/help"):
-        tg_send(chat_id, HELP_MSG)
-        return {"ok": True}
+    chat_id = message["chat"]["id"]
+    text = (message.get("text") or "").strip()
 
-    # تحية؟
-    if is_greeting(t):
-        tg_send(chat_id, "أهلًا! 🙌 أرسل وصف الأتمتة التي تريدها وسأرجع لك ملف n8n جاهز.\n\n" + HELP_MSG)
-        return {"ok": True}
+    # أوامر بسيطة
+    if text in ("/start", "start"):
+        await tg_send(chat_id,
+            "أهلًا بك! أكتب وصف الأتمتة بالعربية وسأبني لك ملف n8n جاهز للاستيراد.\n"
+            "مثال:\n"
+            "• كل يوم 08:00 ابعثلي سعر البيتكوين\n"
+            "• راقب https://httpbin.org/status/200 ونبهني لو تعطّل\n"
+            "• كل 5 دقائق افحص API وأرسل تنبيه إلى تيليغرام")
+        return JSONResponse({"ok": True})
 
-    # ليس وصف أتمتة واضح؟
-    if not looks_like_task(t):
-        tg_send(chat_id, "يبدو أنها رسالة عامة 🙂\nأرسل وصف الأتمتة مثل الأمثلة التالية:\n"
-                         "• كل يوم 08:00 ابعثلي سعر البيتكوين\n"
-                         "• Webhook يستقبل email و pdf_url ويحمّل الملف ثم يرسل الرابط\n"
-                         "أو اكتب /help للمزيد.")
-        return {"ok": True}
+    if text in ("/help", "help"):
+        await tg_send(chat_id,
+            "أرسل وصفًا بسيطًا لما تريد أتمتته، وأنا أختار الأدوات تلقائيًا (Cron/HTTP/Telegram).")
+        return JSONResponse({"ok": True})
 
-    # هنا نولّد الأتمتة
+    # تلميح خفيف لو ما ظهر أنه مهمة، لكن **لا نوقف التنفيذ**
+    if not looks_like_task(text):
+        await tg_send(chat_id, "حاضر! سأحاول بناء أتمتة من وصفك حتى لو كان عام ✨")
+
+    # 1) تخطيط → WorkflowSpec
     try:
-        spec = plan_from_text(t)
-        spec.timezone = TIMEZONE
-
-        issues = static_checks(spec) + active_checks(spec)
-        wf = spec_to_n8n(spec)
-        wf_json = json.dumps(wf, ensure_ascii=False, indent=2)
-
-        report = "✅ الفحوصات الأساسية مرت بنجاح." if not issues else "⚠️ ملاحظات:\n- " + "\n- ".join(issues)
-        tg_send(chat_id, report[:3900])
-
-        tg_send_doc(chat_id, "workflow.json", wf_json.encode("utf-8"),
-                    caption="هذا هو ملف n8n جاهز للاستيراد.")
-    except ValidationError as ve:
-        tg_send(chat_id, f"❌ خطأ في بناء المخطط:\n{ve}")
+        spec = plan_from_text(text)
     except Exception as e:
-        tg_send(chat_id, f"❌ خطأ غير متوقع: {e}")
+        await tg_send(chat_id, f"تعذّر إنشاء الخطة: {e}")
+        return JSONResponse({"ok": False})
 
-    return {"ok": True}
+    # 2) فحوصات
+    issues = []
+    try:
+        issues.extend(static_checks(spec))
+        if not SKIP_ACTIVE:
+            issues.extend(active_checks(spec))
+    except Exception as e:
+        issues.append(f"تعذّر إجراء الفحوص: {e}")
+
+    if issues:
+        pretty = "⚠️ ملاحظات:\n- " + "\n- ".join(issues[:10])
+        await tg_send(chat_id, pretty)
+
+    # 3) تحويل إلى n8n JSON
+    try:
+        n8n_obj = spec_to_n8n(spec)
+    except Exception as e:
+        await tg_send(chat_id, f"تعذّر توليد n8n JSON: {e}")
+        return JSONResponse({"ok": False})
+
+    # 4) إرسال الملف كمستند
+    try:
+        data = json.dumps(n8n_obj, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+        await tg_send_document(chat_id, "workflow.json", data, caption="هذا هو ملف n8n جاهز للاستيراد.")
+    except Exception as e:
+        await tg_send(chat_id, f"توليد الملف نجح لكن فشل الإرسال: {e}")
+
+    # 5) ملخّص افتراضات مفيدة للمستخدم
+    try:
+        assumptions = []
+        try_urls = [str(s.params.get("url", "")) for s in getattr(spec, "steps", []) if getattr(s, "type", "") == "http"]
+        if any("binance.com" in u for u in try_urls):
+            assumptions.append("استخدمت Binance لأسعار BTC لتجنّب مشاكل DNS.")
+        if getattr(spec, "trigger", None) and spec.trigger.type == "cron":
+            h = spec.trigger.config.get("hour")
+            m = spec.trigger.config.get("minute")
+            assumptions.append(f"موعد التنفيذ: {h}:{m} (افتراضي/مستخلص).")
+        if assumptions:
+            await tg_send(chat_id, "ℹ️ افتراضات:\n- " + "\n- ".join(assumptions)[:3500])
+    except Exception:
+        pass
+
+    return JSONResponse({"ok": True})
+
+
+# ========= تشغيل محلي (اختياري) =========
+# uvicorn app.main:app --host 0.0.0.0 --port 8080
